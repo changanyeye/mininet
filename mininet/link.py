@@ -24,14 +24,10 @@ TCIntf: interface with bandwidth limiting and delay via tc
 Link: basic link class for creating veth pairs
 """
 
-import re
-
 from mininet.log import info, error, debug
 from mininet.util import makeIntfPair
-
-# Make pylint happy:
-# pylint: disable=too-many-arguments
-
+import mininet.node
+import re
 
 class Intf( object ):
 
@@ -55,12 +51,11 @@ class Intf( object ):
             self.ip = '127.0.0.1'
             self.prefixLen = 8
         # Add to node (and move ourselves if necessary )
-        if node:
-            moveIntfFn = params.pop( 'moveIntfFn', None )
-            if moveIntfFn:
-                node.addIntf( self, port=port, moveIntfFn=moveIntfFn )
-            else:
-                node.addIntf( self, port=port )
+        moveIntfFn = params.pop( 'moveIntfFn', None )
+        if moveIntfFn:
+            node.addIntf( self, port=port, moveIntfFn=moveIntfFn )
+        else:
+            node.addIntf( self, port=port )
         # Save params for future reference
         self.params = params
         self.config( **params )
@@ -151,9 +146,6 @@ class Intf( object ):
 
     def rename( self, newname ):
         "Rename interface"
-        if self.node and self.name in self.node.nameToIntf:
-            # rename intf in node's nameToIntf
-            self.node.nameToIntf[newname] = self.node.nameToIntf.pop(self.name)
         self.ifconfig( 'down' )
         result = self.cmd( 'ip link set', self.name, 'name', newname )
         self.name = newname
@@ -172,10 +164,10 @@ class Intf( object ):
            method: config method name
            param: arg=value (ignore if value=None)
            value may also be list or dict"""
-        name, value = list( param.items() )[ 0 ]
+        name, value = list(param.items())[ 0 ]
         f = getattr( self, method, None )
         if not f or value is None:
-            return None
+            return
         if isinstance( value, list ):
             result = f( *value )
         elif isinstance( value, dict ):
@@ -210,8 +202,6 @@ class Intf( object ):
         # if self.node.inNamespace:
         # Link may have been dumped into root NS
         # quietRun( 'ip link del ' + self.name )
-        self.node.delIntf( self )
-        self.link = None
 
     def status( self ):
         "Return intf status as a string"
@@ -238,7 +228,8 @@ class TCIntf( Intf ):
     bwParamMax = 1000
 
     def bwCmds( self, bw=None, speedup=0, use_hfsc=False, use_tbf=False,
-                latency_ms=None, enable_ecn=False, enable_red=False ):
+                latency_ms=None, enable_ecn=False, enable_red=False,
+                smooth_change=False ):
         "Return tc commands to set bandwidth"
 
         cmds, parent = [], ' root '
@@ -247,6 +238,8 @@ class TCIntf( Intf ):
             error( 'Bandwidth limit', bw, 'is outside supported range 0..%d'
                    % self.bwParamMax, '- ignoring\n' )
         elif bw is not None:
+            smooth_change_str = 'change' if smooth_change else 'add'
+            
             # BL: this seems a bit brittle...
             if ( speedup > 0 and
                  self.node.name[0:1] == 's' ):
@@ -256,18 +249,24 @@ class TCIntf( Intf ):
             # are specifying the correct sizes. For now I have used
             # the same settings we had in the mininet-hifi code.
             if use_hfsc:
-                cmds += [ '%s qdisc add dev %s root handle 5:0 hfsc default 1',
-                          '%s class add dev %s parent 5:0 classid 5:1 hfsc sc '
+                if not smooth_change:
+                    cmds += [ '%s qdisc add dev %s root handle 5:0 hfsc default 1']
+                cmds += ['%s class ' + smooth_change_str + ' dev %s parent 5:0 classid 5:1 hfsc sc '
                           + 'rate %fMbit ul rate %fMbit' % ( bw, bw ) ]
             elif use_tbf:
                 if latency_ms is None:
-                    latency_ms = 15.0 * 8 / bw
+                    latency_ms = 15 * 8 / bw
+                if smooth_change:
+                    error("tbf does not support smooth change")
+                    
                 cmds += [ '%s qdisc add dev %s root handle 5: tbf ' +
                           'rate %fMbit burst 15000 latency %fms' %
                           ( bw, latency_ms ) ]
-            else:
-                cmds += [ '%s qdisc add dev %s root handle 5:0 htb default 1',
-                          '%s class add dev %s parent 5:0 classid 5:1 htb ' +
+            else:    
+                if not smooth_change:
+                    cmds += [ '%s qdisc add dev %s root handle 5:0 htb default 1']
+                cmds += [ '%s class ' + smooth_change_str +
+                          ' dev %s parent 5:0 classid 5:1 htb ' +
                           'rate %fMbit burst 15k' % bw ]
             parent = ' parent 5:1 '
 
@@ -286,25 +285,30 @@ class TCIntf( Intf ):
                           'burst 20 ' +
                           'bandwidth %fmbit probability 1' % bw ]
                 parent = ' parent 6: '
+
         return cmds, parent
 
     @staticmethod
     def delayCmds( parent, delay=None, jitter=None,
-                   loss=None, max_queue_size=None ):
+                   loss=None, max_queue_size=None, smooth_change=False ):
         "Internal method: return tc commands for delay and loss"
         cmds = []
-        if loss and ( loss < 0 or loss > 100 ):
+
+        if jitter and jitter < 0:
+            error( 'Negative jitter', jitter, '\n' )
+        elif loss and ( loss < 0 or loss > 100 ):
             error( 'Bad loss percentage', loss, '%%\n' )
         else:
             # Delay/jitter/loss/max queue size
             netemargs = '%s%s%s%s' % (
                 'delay %s ' % delay if delay is not None else '',
                 '%s ' % jitter if jitter is not None else '',
-                'loss %.5f ' % loss if (loss is not None and loss > 0) else '',
+                'loss %.5f ' % loss if loss is not None else '',
                 'limit %d' % max_queue_size if max_queue_size is not None
                 else '' )
             if netemargs:
-                cmds = [ '%s qdisc add dev %s ' + parent +
+                smooth_change_str = 'replace' if smooth_change else 'add'
+                cmds = [ '%s qdisc ' + smooth_change_str + ' dev %s ' + parent +
                          ' handle 10: netem ' +
                          netemargs ]
                 parent = ' parent 10:1 '
@@ -316,53 +320,64 @@ class TCIntf( Intf ):
         debug(" *** executing command: %s\n" % c)
         return self.cmd( c )
 
-    def config(  # pylint: disable=arguments-renamed,arguments-differ
-                self,
-                bw=None, delay=None, jitter=None, loss=None,
-                gro=False, txo=True, rxo=True,
-                speedup=0, use_hfsc=False, use_tbf=False,
+    def requiresHardReset(self, bw, delay, jitter, loss, max_queue_size, use_hfsc, use_tbf):
+        # pessimistic assumptions: always require hard reset when limits are
+        # set from not None to None or the tc type changes
+        return ((bw is None and self.bw is not None) or
+                (delay is None and self.delay is not None) or
+                (jitter is None and self.jitter is not None) or
+                (loss is None and self.loss is not None) or
+                (max_queue_size is None and self.max_queue_size is not None) or
+                self.use_hfsc is not use_hfsc or
+                self.use_tbf is not use_tbf)
+
+    def storeConfig(self, bw, delay, jitter, loss, max_queue_size, use_hfsc, use_tbf):
+        self.bw = bw
+        self.delay = delay
+        self.jitter = jitter
+        self.loss = loss
+        self.max_queue_size = max_queue_size
+        self.use_hfsc = use_hfsc
+        self.use_tbf = use_tbf
+
+    def firstTimeConfig(self):
+        # any attribute could be used for this...
+        return not hasattr(self, 'use_hfsc')
+    
+    def config( self, bw=None, delay=None, jitter=None, loss=None,
+                disable_gro=True, speedup=0, use_hfsc=False, use_tbf=False,
                 latency_ms=None, enable_ecn=False, enable_red=False,
-                max_queue_size=None, **params ):
-        """Configure the port and set its properties.
-           bw: bandwidth in b/s (e.g. '10m')
-           delay: transmit delay (e.g. '1ms' )
-           jitter: jitter (e.g. '1ms')
-           loss: loss (e.g. '1%' )
-           gro: enable GRO (False)
-           txo: enable transmit checksum offload (True)
-           rxo: enable receive checksum offload (True)
-           speedup: experimental switch-side bw option
-           use_hfsc: use HFSC scheduling
-           use_tbf: use TBF scheduling
-           latency_ms: TBF latency parameter
-           enable_ecn: enable ECN (False)
-           enable_red: enable RED (False)
-           max_queue_size: queue limit parameter for netem"""
-
-        # Support old names for parameters
-        gro = not params.pop( 'disable_gro', not gro )
-
+                max_queue_size=None, smooth_change=False, **params ):
+        "Configure the port and set its properties."
+        
         result = Intf.config( self, **params)
 
-        def on( isOn ):
-            "Helper method: bool -> 'on'/'off'"
-            return 'on' if isOn else 'off'
+        # Disable GRO
+        if disable_gro:
+            self.cmd( 'ethtool -K %s gro off' % self )
 
-        # Set offload parameters with ethool
-        self.cmd( 'ethtool -K', self,
-                  'gro', on( gro ),
-                  'tx', on( txo ),
-                  'rx', on( rxo ) )
+        # Optimization: return if nothing else to configure and nothing changed.
+        # Note that the attribute 'use_hfsc' is only available if previous calls
+        # passed this check.
+        if ( bw is None and delay is None and loss is None
+             and max_queue_size is None and self.firstTimeConfig()):
+            return
 
-        # Optimization: return if nothing else to configure
-        # Question: what happens if we want to reset things?
-        if ( bw is None and not delay and not loss
-             and max_queue_size is None ):
-            return None
+        if smooth_change and self.firstTimeConfig():
+            error("smooth change is not support for setting initial values")
+            smooth_change = False
 
+        if (smooth_change and
+               self.requiresHardReset(bw, delay, jitter, loss, max_queue_size, use_hfsc, use_tbf)):
+            error("smooth change is not support if tc type changes or limits set to None")
+            smooth_change = False
+            
+        self.storeConfig(bw, delay, jitter, loss, max_queue_size, use_hfsc, use_tbf)
+        
         # Clear existing configuration
         tcoutput = self.tc( '%s qdisc show dev %s' )
-        if "priomap" not in tcoutput and "noqueue" not in tcoutput:
+        if ( "priomap" not in tcoutput and "noqueue" not in tcoutput
+             and not smooth_change ):
             cmds = [ '%s qdisc del dev %s root' ]
         else:
             cmds = []
@@ -372,14 +387,16 @@ class TCIntf( Intf ):
                                       use_hfsc=use_hfsc, use_tbf=use_tbf,
                                       latency_ms=latency_ms,
                                       enable_ecn=enable_ecn,
-                                      enable_red=enable_red )
+                                      enable_red=enable_red,
+                                      smooth_change=smooth_change)
         cmds += bwcmds
 
         # Delay/jitter/loss/max_queue_size using netem
         delaycmds, parent = self.delayCmds( delay=delay, jitter=jitter,
                                             loss=loss,
                                             max_queue_size=max_queue_size,
-                                            parent=parent )
+                                            parent=parent,
+                                            smooth_change=smooth_change)
         cmds += delaycmds
 
         # Ugly but functional: display configuration info
@@ -414,7 +431,7 @@ class Link( object ):
     def __init__( self, node1, node2, port1=None, port2=None,
                   intfName1=None, intfName2=None, addr1=None, addr2=None,
                   intf=Intf, cls1=None, cls2=None, params1=None,
-                  params2=None, fast=True, **params ):
+                  params2=None, fast=True ):
         """Create veth link to another node, making two new interfaces.
            node1: first node
            node2: second node
@@ -424,15 +441,18 @@ class Link( object ):
            cls1, cls2: optional interface-specific constructors
            intfName1: node1 interface name (optional)
            intfName2: node2  interface name (optional)
-           params1: parameters for interface 1 (optional)
-           params2: parameters for interface 2 (optional)
-           **params: additional parameters for both interfaces"""
-
+           params1: parameters for interface 1
+           params2: parameters for interface 2"""
         # This is a bit awkward; it seems that having everything in
         # params is more orthogonal, but being able to specify
         # in-line arguments is more convenient! So we support both.
-        params1 = dict( params1 ) if params1 else {}
-        params2 = dict( params2 ) if params2 else {}
+        if params1 is None:
+            params1 = {}
+        if params2 is None:
+            params2 = {}
+        # Allow passing in params1=params2
+        if params2 is params1:
+            params2 = dict( params1 )
         if port1 is not None:
             params1[ 'port' ] = port1
         if port2 is not None:
@@ -445,10 +465,6 @@ class Link( object ):
             intfName1 = self.intfName( node1, params1[ 'port' ] )
         if not intfName2:
             intfName2 = self.intfName( node2, params2[ 'port' ] )
-
-        # Update with remaining parameter list
-        params1.update( params )
-        params2.update( params )
 
         self.fast = fast
         if fast:
@@ -471,7 +487,6 @@ class Link( object ):
 
         # All we are is dust in the wind, and our two interfaces
         self.intf1, self.intf2 = intf1, intf2
-
     # pylint: enable=too-many-branches
 
     @staticmethod
@@ -505,9 +520,9 @@ class Link( object ):
     def delete( self ):
         "Delete this link"
         self.intf1.delete()
-        self.intf1 = None
-        self.intf2.delete()
-        self.intf2 = None
+        # We only need to delete one side, though this doesn't seem to
+        # cost us much and might help subclasses.
+        # self.intf2.delete()
 
     def stop( self ):
         "Override to stop and clean up link as needed"
@@ -540,17 +555,13 @@ class OVSLink( Link ):
 
     def __init__( self, node1, node2, **kwargs ):
         "See Link.__init__() for options"
-        if 'OVSSwitch' not in globals():
-            # pylint: disable=import-outside-toplevel,cyclic-import
-            from mininet.node import OVSSwitch
         self.isPatchLink = False
-        if ( isinstance( node1, OVSSwitch ) and
-             isinstance( node2, OVSSwitch ) ):
+        if ( isinstance( node1, mininet.node.OVSSwitch ) and
+             isinstance( node2, mininet.node.OVSSwitch ) ):
             self.isPatchLink = True
             kwargs.update( cls1=OVSIntf, cls2=OVSIntf )
         Link.__init__( self, node1, node2, **kwargs )
 
-    # pylint: disable=arguments-renamed, arguments-differ, signature-differs
     def makeIntfPair( self, *args, **kwargs ):
         "Usually delegated to OVSSwitch"
         if self.isPatchLink:
@@ -560,12 +571,17 @@ class OVSLink( Link ):
 
 
 class TCLink( Link ):
-    "Link with TC interfaces"
-    def __init__( self, *args, **kwargs):
-        kwargs.setdefault( 'cls1', TCIntf )
-        kwargs.setdefault( 'cls2', TCIntf )
-        Link.__init__( self, *args, **kwargs)
-
+    "Link with symmetric TC interfaces configured via opts"
+    def __init__( self, node1, node2, port1=None, port2=None,
+                  intfName1=None, intfName2=None,
+                  addr1=None, addr2=None, **params ):
+        Link.__init__( self, node1, node2, port1=port1, port2=port2,
+                       intfName1=intfName1, intfName2=intfName2,
+                       cls1=TCIntf,
+                       cls2=TCIntf,
+                       addr1=addr1, addr2=addr2,
+                       params1=params,
+                       params2=params )
 
 class TCULink( TCLink ):
     """TCLink with default settings optimized for UserSwitch
